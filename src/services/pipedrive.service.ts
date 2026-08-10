@@ -1,10 +1,5 @@
 import type { PipedrivePerson } from "../types/pipedrive";
-import type {
-  PipedriveApiResponse,
-  PipedriveSearchData,
-  PersonPayload,
-} from "../types/mapping";
-
+import type { ApiResponse, SearchResult, PersonPayload } from "../types/mapping";
 
 export class PipedriveApiError extends Error {
   constructor(
@@ -17,162 +12,105 @@ export class PipedriveApiError extends Error {
   }
 }
 
-/** Validates that required environment variables are present */
-const getConfig = (): { apiKey: string; baseUrl: string } => {
+function getConfig() {
   const apiKey = process.env.PIPEDRIVE_API_KEY;
-  const companyDomain = process.env.PIPEDRIVE_COMPANY_DOMAIN;
+  const domain = process.env.PIPEDRIVE_COMPANY_DOMAIN;
 
-  if (!apiKey) {
-    throw new Error(
-      "PIPEDRIVE_API_KEY is not set. Please add it to your .env file."
-    );
-  }
+  if (!apiKey) throw new Error("PIPEDRIVE_API_KEY is not set in .env");
+  if (!domain) throw new Error("PIPEDRIVE_COMPANY_DOMAIN is not set in .env");
 
-  if (!companyDomain) {
-    throw new Error(
-      "PIPEDRIVE_COMPANY_DOMAIN is not set. Please add it to your .env file."
-    );
-  }
+  return { apiKey, baseUrl: `https://${domain}.pipedrive.com` };
+}
 
-  return {
-    apiKey,
-    baseUrl: `https://${companyDomain}.pipedrive.com`,
-  };
-};
-
-const makeRequest = async <T>(
-  endpoint: string,
-  options: RequestInit = {}
-): Promise<PipedriveApiResponse<T>> => {
+async function request<T>(endpoint: string, options: RequestInit = {}): Promise<ApiResponse<T>> {
   const { apiKey, baseUrl } = getConfig();
+  const sep = endpoint.includes("?") ? "&" : "?";
+  const url = `${baseUrl}${endpoint}${sep}api_token=${apiKey}`;
 
-  // Append api_token to the URL
-  const separator = endpoint.includes("?") ? "&" : "?";
-  const url = `${baseUrl}${endpoint}${separator}api_token=${apiKey}`;
-
-  let response: Response;
+  let res: Response;
 
   try {
-    response = await fetch(url, {
+    res = await fetch(url, {
       ...options,
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        ...options.headers,
-      },
+      headers: { "Content-Type": "application/json", Accept: "application/json", ...options.headers },
     });
-  } catch (networkError) {
-    // Edge Case 3: Network failure — provide actionable error message
+  } catch (err) {
     throw new PipedriveApiError(
-      `Network error while calling ${endpoint}: ${(networkError as Error).message}. ` +
-      "Please check your internet connection and PIPEDRIVE_COMPANY_DOMAIN.",
+      `Network error on ${endpoint}: ${(err as Error).message}`,
       0,
       endpoint
     );
   }
 
-  // Handle specific HTTP error statuses
-  if (!response.ok) {
-    const errorBody = await response.text().catch(() => "Unable to read error body");
+  if (!res.ok) {
+    const body = await res.text().catch(() => "Could not read error body");
 
-    switch (response.status) {
-      case 401:
-        throw new PipedriveApiError(
-          "Authentication failed. Please verify your PIPEDRIVE_API_KEY is correct and active.",
-          401,
-          endpoint
-        );
-      case 404:
-        throw new PipedriveApiError(
-          `Endpoint not found: ${endpoint}. Please verify your PIPEDRIVE_COMPANY_DOMAIN.`,
-          404,
-          endpoint
-        );
-      case 429:
-        // Edge Case 3: Rate limiting
-        throw new PipedriveApiError(
-          "Rate limit exceeded. Pipedrive API allows limited requests per second. " +
-          "Please wait a moment and try again.",
-          429,
-          endpoint
-        );
-      default:
-        throw new PipedriveApiError(
-          `API error (${response.status}): ${errorBody}`,
-          response.status,
-          endpoint
-        );
+    if (res.status === 401) {
+      throw new PipedriveApiError("Authentication failed. Check your PIPEDRIVE_API_KEY.", 401, endpoint);
     }
+    if (res.status === 404) {
+      throw new PipedriveApiError(`Endpoint not found: ${endpoint}. Check PIPEDRIVE_COMPANY_DOMAIN.`, 404, endpoint);
+    }
+    if (res.status === 429) {
+      throw new PipedriveApiError("Rate limit exceeded. Wait a moment and try again.", 429, endpoint);
+    }
+    throw new PipedriveApiError(`API error (${res.status}): ${body}`, res.status, endpoint);
   }
 
-  return response.json() as Promise<PipedriveApiResponse<T>>;
-};
+  return res.json() as Promise<ApiResponse<T>>;
+}
 
-export const searchPersonByName = async (
-  name: string
-): Promise<number | null> => {
-  console.log(` Searching for person with name: "${name}"...`);
+export async function searchPersonByName(name: string): Promise<number | null> {
+  console.log(`Searching for person: "${name}"...`);
 
-  const encodedName = encodeURIComponent(name);
-  const endpoint = `/api/v1/persons/search?term=${encodedName}&exact_match=true&fields=name`;
-
-  const result = await makeRequest<PipedriveSearchData>(endpoint);
+  const term = encodeURIComponent(name);
+  const result = await request<SearchResult>(`/api/v1/persons/search?term=${term}&exact_match=true&fields=name`);
 
   if (!result.success || !result.data) {
-    console.log("   No results returned from search.");
+    console.log("  No results from search.");
     return null;
   }
 
-  const items = result.data.items;
+  const { items } = result.data;
 
   if (!items || items.length === 0) {
-    console.log(`   No person found with name "${name}".`);
+    console.log(`  No person found with name "${name}".`);
     return null;
   }
 
-  const personId = items[0].item.id;
-  console.log(` Found existing person with ID: ${personId}`);
+  const id = items[0].item.id;
+  console.log(`  Found existing person (ID: ${id})`);
+  return id;
+}
 
-  return personId;
-};
+export async function createPerson(payload: PersonPayload): Promise<PipedrivePerson> {
+  console.log("Creating new person...");
 
-export const createPerson = async (
-  payload: PersonPayload
-): Promise<PipedrivePerson> => {
-  console.log(" Creating new Pipedrive person...");
-
-  const result = await makeRequest<PipedrivePerson>("/api/v1/persons", {
+  const result = await request<PipedrivePerson>("/api/v1/persons", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 
   if (!result.success || !result.data) {
-    throw new Error(
-      `Failed to create person. API response: ${JSON.stringify(result)}`
-    );
+    throw new Error(`Failed to create person: ${JSON.stringify(result)}`);
   }
 
-  console.log(` Person created with ID: ${result.data.id}`);
+  console.log(`  Created person (ID: ${result.data.id})`);
   return result.data;
-};
+}
 
-export const updatePerson = async (
-  id: number,
-  payload: PersonPayload
-): Promise<PipedrivePerson> => {
-  console.log(`  Updating Pipedrive person (ID: ${id})...`);
+export async function updatePerson(id: number, payload: PersonPayload): Promise<PipedrivePerson> {
+  console.log(`Updating person (ID: ${id})...`);
 
-  const result = await makeRequest<PipedrivePerson>(`/api/v1/persons/${id}`, {
+  const result = await request<PipedrivePerson>(`/api/v1/persons/${id}`, {
     method: "PUT",
     body: JSON.stringify(payload),
   });
 
   if (!result.success || !result.data) {
-    throw new Error(
-      `Failed to update person ${id}. API response: ${JSON.stringify(result)}`
-    );
+    throw new Error(`Failed to update person ${id}: ${JSON.stringify(result)}`);
   }
 
-  console.log(` Person updated successfully (ID: ${result.data.id})`);
+  console.log(`  Updated person (ID: ${result.data.id})`);
   return result.data;
-};
+}
